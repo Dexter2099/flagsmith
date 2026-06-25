@@ -66,6 +66,8 @@ if typing.TYPE_CHECKING:
     from collections.abc import Sequence
     from datetime import datetime
 
+    from rest_framework.request import Request
+
     from experimentation.models import Experiment, Metric, WarehouseConnection
     from experimentation.types import ExposureGranularity
     from organisations.models import Organisation
@@ -502,7 +504,7 @@ def create_experiment_audit_log(
 def transition_experiment_status(
     experiment: Experiment,
     target_status: str,
-    user: FFAdminUser,
+    request: Request,
 ) -> Experiment:
     valid_targets = VALID_STATUS_TRANSITIONS.get(experiment.status, set())
     if target_status not in valid_targets:
@@ -510,15 +512,21 @@ def transition_experiment_status(
             f"Cannot transition from '{experiment.status}' to '{target_status}'."
         )
 
-    experiment.status = target_status
+    user: FFAdminUser = request.user  # type: ignore[assignment]
+    with transaction.atomic():
+        experiment.status = target_status
 
-    if target_status == ExperimentStatus.RUNNING and not experiment.started_at:
-        experiment.started_at = timezone.now()
-    elif target_status == ExperimentStatus.COMPLETED:
-        experiment.ended_at = timezone.now()
+        if target_status == ExperimentStatus.RUNNING and not experiment.started_at:
+            experiment.started_at = timezone.now()
+        elif target_status == ExperimentStatus.COMPLETED:
+            experiment.ended_at = timezone.now()
 
-    experiment.save()
-    create_experiment_audit_log(experiment, user, action=target_status)
+        experiment.save()
+
+        if target_status == ExperimentStatus.RUNNING:
+            enable_experiment_rollout(experiment, request)
+
+        create_experiment_audit_log(experiment, user, action=target_status)
     return experiment
 
 
@@ -629,6 +637,34 @@ def get_experiment_rollout(experiment: Experiment) -> dict[str, typing.Any] | No
             for mv in feature_state.multivariate_feature_state_values.all()
         ],
     }
+
+
+def enable_experiment_rollout(experiment: Experiment, request: Request) -> None:
+    """Enable the rollout segment override so a started experiment serves its
+    split to traffic. No-op when the experiment has no rollout, or the override
+    is already enabled."""
+    # Imported here to avoid a circular import: serializers import this module.
+    from experimentation.serializers import ExperimentRolloutSerializer
+
+    rollout = get_experiment_rollout(experiment)
+    if rollout is None or rollout["enabled"]:
+        return
+
+    # Re-apply the existing override as-is but enabled, going through update_flag
+    # so the change is versioned like any other flag write. Multivariate
+    # allocations are preserved by update_flag when omitted from the change set.
+    spec = ExperimentRolloutSerializer.to_spec(rollout, request)
+    update_flag(
+        experiment.environment,
+        experiment.feature,
+        FlagChangeSet(
+            author=spec.author,
+            enabled=True,
+            feature_state_value=spec.feature_state_value,
+            type_=spec.value_type,
+            segment_id=experiment.rollout_segment_id,
+        ),
+    )
 
 
 def mark_warehouse_pending_connection(

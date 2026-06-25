@@ -393,7 +393,7 @@ class ExperimentViewSet(
         experiment: Experiment = self.get_object()
         try:
             experiment = transition_experiment_status(
-                experiment, target_status, self._get_user(self.request)
+                experiment, target_status, self.request
             )
         except ValueError:
             logger.warning(

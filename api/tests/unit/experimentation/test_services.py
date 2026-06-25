@@ -2,6 +2,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 
 import pytest
+from django.test import RequestFactory
 from flag_engine.segments.constants import PERCENTAGE_SPLIT
 from pytest_django.fixtures import SettingsWrapper
 from pytest_mock import MockerFixture
@@ -40,6 +41,7 @@ from features.models import Feature, FeatureState
 from features.multivariate.models import MultivariateFeatureOption
 from features.value_types import STRING
 from features.versioning.dataclasses import MultivariateValueChangeSet
+from features.versioning.models import EnvironmentFeatureVersion
 from segments.models import Condition
 from users.models import FFAdminUser
 
@@ -1574,3 +1576,128 @@ def test_get_experiment_rollout__boolean_value__returns_lowercase_string(
     # Then
     assert rollout is not None
     assert rollout["feature_state_value"] == {"type": "boolean", "value": "true"}
+
+
+def test_enable_experiment_rollout__disabled_override__enables(
+    experiment: Experiment,
+    multivariate_options: list[MultivariateFeatureOption],
+    admin_user: FFAdminUser,
+    rf: RequestFactory,
+) -> None:
+    # Given a configured but disabled rollout
+    option_a, option_b, _ = multivariate_options
+    services.apply_experiment_rollout(
+        experiment,
+        RolloutSpec(
+            enabled=False,
+            rollout_percentage=20.0,
+            feature_state_value="control",
+            value_type="string",
+            multivariate_values=[
+                MultivariateValueChangeSet(option_a.id, 50.0),
+                MultivariateValueChangeSet(option_b.id, 50.0),
+            ],
+            author=AuthorData(user=admin_user),
+        ),
+    )
+    request = rf.post("/")
+    request.user = admin_user
+
+    # When
+    services.enable_experiment_rollout(experiment, request)
+
+    # Then the override is live with its value and allocations preserved
+    rollout = services.get_experiment_rollout(experiment)
+    assert rollout is not None
+    assert rollout["enabled"] is True
+    assert rollout["rollout_percentage"] == 20.0
+    assert rollout["feature_state_value"] == {"type": "string", "value": "control"}
+    assert {
+        (mv["multivariate_feature_option"], mv["percentage_allocation"])
+        for mv in rollout["multivariate_feature_state_values"]
+    } == {(option_a.id, 50.0), (option_b.id, 50.0)}
+
+
+def test_enable_experiment_rollout__already_enabled__does_not_write(
+    experiment_with_rollout: Experiment,
+    admin_user: FFAdminUser,
+    rf: RequestFactory,
+    mocker: MockerFixture,
+) -> None:
+    # Given a rollout that is already enabled (from the fixture)
+    update_flag_spy = mocker.patch("experimentation.services.update_flag")
+    request = rf.post("/")
+    request.user = admin_user
+
+    # When
+    services.enable_experiment_rollout(experiment_with_rollout, request)
+
+    # Then no flag write happens
+    update_flag_spy.assert_not_called()
+
+
+def test_enable_experiment_rollout__no_rollout__does_not_write(
+    experiment: Experiment,
+    admin_user: FFAdminUser,
+    rf: RequestFactory,
+    mocker: MockerFixture,
+) -> None:
+    # Given an experiment without a rollout
+    update_flag_spy = mocker.patch("experimentation.services.update_flag")
+    request = rf.post("/")
+    request.user = admin_user
+
+    # When
+    services.enable_experiment_rollout(experiment, request)
+
+    # Then
+    update_flag_spy.assert_not_called()
+
+
+def test_enable_experiment_rollout__v2_versioning__publishes_enabled_override(
+    environment_v2_versioning: Environment,
+    multivariate_feature: Feature,
+    multivariate_options: list[MultivariateFeatureOption],
+    admin_user: FFAdminUser,
+    rf: RequestFactory,
+) -> None:
+    # Given a disabled rollout on a v2 environment
+    option_a, _, _ = multivariate_options
+    experiment = Experiment.objects.create(
+        environment=environment_v2_versioning,
+        feature=multivariate_feature,
+        name="exp",
+        hypothesis="h",
+        status=ExperimentStatus.CREATED,
+    )
+    services.apply_experiment_rollout(
+        experiment,
+        RolloutSpec(
+            enabled=False,
+            rollout_percentage=30.0,
+            feature_state_value="control",
+            value_type="string",
+            multivariate_values=[MultivariateValueChangeSet(option_a.id, 60.0)],
+            author=AuthorData(user=admin_user),
+        ),
+    )
+    request = rf.post("/")
+    request.user = admin_user
+    versions_before = EnvironmentFeatureVersion.objects.filter(
+        environment=environment_v2_versioning, feature=multivariate_feature
+    ).count()
+
+    # When
+    services.enable_experiment_rollout(experiment, request)
+
+    # Then a new version is published that enables the override, value preserved
+    assert (
+        EnvironmentFeatureVersion.objects.filter(
+            environment=environment_v2_versioning, feature=multivariate_feature
+        ).count()
+        == versions_before + 1
+    )
+    rollout = services.get_experiment_rollout(experiment)
+    assert rollout is not None
+    assert rollout["enabled"] is True
+    assert rollout["feature_state_value"] == {"type": "string", "value": "control"}
